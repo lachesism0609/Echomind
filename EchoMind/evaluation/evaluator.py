@@ -117,34 +117,63 @@ Agent 响应: {response}
         context: Optional[str] = None,
     ) -> QualityScores:
         ctx_section = f"背景信息: {context}" if context else ""
-        prompt = self.JUDGE_PROMPT.format(
-            question=question,
-            response=response,
-            context_section=ctx_section,
+        prompt = self._clean_text(
+            self.JUDGE_PROMPT.format(
+                question=question,
+                response=response,
+                context_section=ctx_section,
+            )
         )
-        prompt = self._clean_text(prompt)
-        try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("{"), raw.rfind("}") + 1
-            data = json.loads(raw[s:e])
-            return QualityScores(
-                relevance=float(data.get("relevance", 0.5)),
-                accuracy=float(data.get("accuracy", 0.5)),
-                completeness=float(data.get("completeness", 0.5)),
-                helpfulness=float(data.get("helpfulness", 0.5)),
-            )
-        except Exception as ex:
-            logger.warning(f"LLM Judge 失败: {ex}")
-            return QualityScores(
-                0.5, 0.5, 0.5, 0.5,
-                judge_failed=True,
-                error=str(ex),
-            )
 
+        last_error = ""
+        for _ in range(2):
+            try:
+                data = await self._request_scores(prompt)
+                return QualityScores(
+                    relevance=float(data.get("relevance", 0.5)),
+                    accuracy=float(data.get("accuracy", 0.5)),
+                    completeness=float(data.get("completeness", 0.5)),
+                    helpfulness=float(data.get("helpfulness", 0.5)),
+                )
+            except Exception as ex:  # noqa: BLE001
+                last_error = str(ex)
+                logger.warning(f"LLM Judge 尝试失败: {ex}")
+
+        return QualityScores(
+            0.5, 0.5, 0.5, 0.5,
+            judge_failed=True,
+            error=last_error,
+        )
+
+    async def _request_scores(self, prompt: str) -> Dict[str, Any]:
+        """调用模型并返回解析后的评分 JSON。
+
+        max_tokens 给足，避免思考块耗尽额度导致最终 JSON 文本块缺失。
+        """
+        resp = await self._client.messages.create(
+            model=self._model,
+            max_tokens=2048,
+            temperature=0.0,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = extract_text_content(resp.content)
+        return self._parse_json(raw)
+
+    @staticmethod
+    def _parse_json(raw: str) -> Dict[str, Any]:
+        text = (raw or "").strip()
+        # 去掉可能的 markdown 代码块包裹
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:]
+            text = text.strip()
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError(f"Judge 未返回有效 JSON，原文: {text[:200]!r}")
+        return json.loads(text[start : end + 1])
     @staticmethod
     def _clean_text(value: Any) -> str:
         """移除 Unicode 代理字符，避免 LLM 请求编码失败。"""
