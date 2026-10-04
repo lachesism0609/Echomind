@@ -45,6 +45,10 @@ class IntentCategory(Enum):
     TECHNICAL_LOGIN = "technical_login"  # 登录认证故障
     TECHNICAL_CRASH = "technical_crash"  # 崩溃/错误码
     HUMAN_HANDOFF = "human_handoff"      # 转人工
+    PRODUCT_COMPARE   = "product_compare"    # 商品对比（A 和 B 哪个好？）
+    PRODUCT_RECOMMEND = "product_recommend"  # 导购推荐（送什么礼物？）
+    SPEC_INQUIRY      = "spec_inquiry"       # 规格参数（支持XX功能吗？）
+    AVAILABILITY      = "availability"       # 库存/发货时效（现货吗？几天能到？）
     OTHER      = "other"
 
 
@@ -87,6 +91,10 @@ _TEMPLATES: Dict[IntentCategory, List[str]] = {
     IntentCategory.TECHNICAL_LOGIN: ["登录一直报401", "验证码收不到", "无法登录账号"],
     IntentCategory.TECHNICAL_CRASH: ["应用一直崩溃", "页面报500错误", "系统闪退"],
     IntentCategory.HUMAN_HANDOFF: ["转人工客服", "我要找人工", "请升级处理"],
+    IntentCategory.PRODUCT_COMPARE: ["A 和 B 哪个好？", "这两款有什么区别？", "帮我对比一下这两个产品"],
+    IntentCategory.PRODUCT_RECOMMEND: ["给女朋友送什么礼物？", "帮我推荐一款适合的产品", "预算 3000 买什么好？"],
+    IntentCategory.SPEC_INQUIRY: ["这款支持 NFC 功能吗？", "这个产品参数是什么？", "尺寸和重量是多少？"],
+    IntentCategory.AVAILABILITY: ["这款有现货吗？", "下单后几天能到？", "现在能发货吗？"],
 }
 
 _SPECIFIC_INTENTS = {
@@ -99,6 +107,10 @@ _SPECIFIC_INTENTS = {
     IntentCategory.TECHNICAL_LOGIN,
     IntentCategory.TECHNICAL_CRASH,
     IntentCategory.HUMAN_HANDOFF,
+    IntentCategory.PRODUCT_COMPARE,
+    IntentCategory.PRODUCT_RECOMMEND,
+    IntentCategory.SPEC_INQUIRY,
+    IntentCategory.AVAILABILITY,
 }
 
 _GENERIC_INTENTS = {
@@ -314,6 +326,10 @@ class IntentRecognizer:
             IntentCategory.ACCOUNT_SECURITY: ["被盗", "异常登录", "重置密码", "两步验证", "安全"],
             IntentCategory.TECHNICAL_LOGIN: ["无法登录", "登录失败", "401", "验证码"],
             IntentCategory.TECHNICAL_CRASH: ["崩溃", "闪退", "500", "报错", "crash"],
+            IntentCategory.PRODUCT_COMPARE: ["哪个好", "对比", "比较", "区别", "二选一", "vs"],
+            IntentCategory.PRODUCT_RECOMMEND: ["推荐", "适合", "送什么", "礼物", "选购", "买什么", "预算"],
+            IntentCategory.SPEC_INQUIRY: ["参数", "规格", "配置", "尺寸", "重量", "续航", "像素", "内存", "支持什么功能", "有哪些功能"],
+            IntentCategory.AVAILABILITY: ["现货", "库存", "有货", "发货时间", "几天到", "多久到", "什么时候发货", "什么时候到货"],
         }
         generic_patterns = {
             IntentCategory.ESCALATION: ["投诉", "经理", "supervisor"],

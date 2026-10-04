@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, TYPE_CHECKING, Union
 
@@ -288,5 +289,180 @@ def escalation_tools() -> Dict[str, AgentToolSpec]:
             "生成交给人工客服的结构化交接摘要，不会创建真实工单。",
             {"reason": {"type": "string", "description": "需要升级的原因"}},
             create_handoff_summary,
+        ),
+    }
+
+
+# ── 售前导购 ─────────────────────────────────────────────────────────────────
+
+# 演示商品目录。生产环境应替换为商品搜索 API 的客户端，这里只做确定性返回，
+# 避免售前 Agent 编造库存、价格和规格。
+_PRODUCT_CATALOG: List[Dict[str, Any]] = [
+    {
+        "name": "Pro X1 手机",
+        "category": "手机",
+        "price": 3999.0,
+        "specs": {"屏幕": "6.7 英寸", "续航": "5000mAh", "NFC": "支持", "摄像头": "5000 万像素"},
+        "tags": ["拍照", "游戏", "旗舰", "礼物"],
+        "audience": "追求性能与影像体验的用户",
+    },
+    {
+        "name": "Lite A3 手机",
+        "category": "手机",
+        "price": 1999.0,
+        "specs": {"屏幕": "6.5 英寸", "续航": "4500mAh", "NFC": "支持", "摄像头": "4800 万像素"},
+        "tags": ["性价比", "学生", "日常"],
+        "audience": "预算有限、注重日常使用的用户",
+    },
+    {
+        "name": "AirSound Pro 耳机",
+        "category": "耳机",
+        "price": 899.0,
+        "specs": {"降噪": "主动降噪", "续航": "30 小时", "连接": "蓝牙 5.3"},
+        "tags": ["降噪", "通勤", "礼物"],
+        "audience": "通勤、差旅、需要降噪的用户",
+    },
+    {
+        "name": "FitBand 6 手表",
+        "category": "手表",
+        "price": 1299.0,
+        "specs": {"屏幕": "1.43 英寸 AMOLED", "续航": "14 天", "健康": "心率/血氧/睡眠"},
+        "tags": ["运动", "健康", "礼物"],
+        "audience": "关注运动与健康监测的用户",
+    },
+    {
+        "name": "HomePod Mini 音箱",
+        "category": "音箱",
+        "price": 499.0,
+        "specs": {"连接": "Wi-Fi/蓝牙", "控制": "语音助手"},
+        "tags": ["居家", "智能", "礼物"],
+        "audience": "家庭智能场景用户",
+    },
+    {
+        "name": "ThinBook 14 笔记本",
+        "category": "笔记本",
+        "price": 5999.0,
+        "specs": {"屏幕": "14 英寸 2.8K", "内存": "16GB", "重量": "1.29kg"},
+        "tags": ["办公", "轻薄", "生产力"],
+        "audience": "移动办公与生产力用户",
+    },
+]
+
+
+def _extract_user_profile(context: str) -> Dict[str, Any]:
+    """从 MemoryContext.to_prompt_text() 里提取 [用户画像] 的 JSON。"""
+    if not context:
+        return {}
+    marker = "[用户画像]"
+    pos = context.find(marker)
+    if pos == -1:
+        return {}
+    start = context.find("{", pos + len(marker))
+    if start == -1:
+        return {}
+    depth = 0
+    for idx in range(start, len(context)):
+        ch = context[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    data = json.loads(context[start : idx + 1])
+                    return data if isinstance(data, dict) else {}
+                except Exception:
+                    return {}
+    return {}
+
+
+def search_product_catalog(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+    """售前工具：检索商品目录并返回确定性结果，不伪造库存和实时价格。"""
+    query = str(args.get("query") or req.message or "").strip()
+    category = str(args.get("category") or "").strip().lower()
+    budget = args.get("budget")
+    limit = max(1, min(int(args.get("limit", 5) or 5), 10))
+
+    try:
+        budget = float(budget) if budget is not None else None
+    except (TypeError, ValueError):
+        budget = None
+
+    lower_query = query.lower()
+    query_tokens = _query_tokens(lower_query)
+
+    def score(item: Dict[str, Any]) -> float:
+        points = 0.0
+        if category and category in item["category"].lower():
+            points += 2.0
+        haystack = " ".join(
+            [item["name"], item["category"], item["audience"]]
+            + list(item["specs"].values())
+            + list(item["tags"])
+        ).lower()
+        for token in query_tokens:
+            if token and token in haystack:
+                points += 0.35
+        return points
+
+    candidates = [item for item in _PRODUCT_CATALOG if score(item) > 0] or list(_PRODUCT_CATALOG)
+    candidates = [item for item in candidates if budget is None or item["price"] <= budget]
+    candidates = sorted(candidates, key=score, reverse=True)
+
+    results = [
+        {
+            "name": item["name"],
+            "category": item["category"],
+            "price": item["price"],
+            "specs": item["specs"],
+            "tags": item["tags"],
+            "audience": item["audience"],
+        }
+        for item in candidates[:limit]
+    ]
+
+    profile = _extract_user_profile(req.context or "")
+    profile_note = ""
+    if profile:
+        profile_note = "已结合用户画像中的历史偏好进行筛选口径；具体是否适合请以用户实际使用场景为准。"
+
+    return {
+        "success": True,
+        "query": query,
+        "category": category or None,
+        "budget": budget,
+        "matched": len(results),
+        "results": results,
+        "profile_used": bool(profile),
+        "profile": profile,
+        "personalized_note": profile_note,
+        "stock_note": "库存与价格实时变化，请引导用户到商品页确认，不要承诺有货或最后一件。",
+    }
+
+
+def _query_tokens(query: str) -> List[str]:
+    """把查询拆成 ASCII 单词 + 中文二元组，便于和商品目录做包含匹配。"""
+    tokens: List[str] = re.findall(r"[a-z0-9]+", query.lower())
+    for cjk_run in re.findall(r"[\u4e00-\u9fff]+", query):
+        if len(cjk_run) == 1:
+            tokens.append(cjk_run)
+        else:
+            tokens.extend(cjk_run[i : i + 2] for i in range(len(cjk_run) - 1))
+    return tokens
+
+
+def pre_sale_tools() -> Dict[str, AgentToolSpec]:
+    return {
+        "search_product_catalog": make_tool(
+            "search_product_catalog",
+            "检索商品目录，返回商品规格、价格区间、适用人群和标签，用于对比、推荐和规格解释；不返回实时库存。",
+            {
+                "query": {"type": "string", "description": "用户诉求或商品关键词"},
+                "category": {"type": "string", "description": "商品分类，例如手机、耳机、手表"},
+                "budget": {"type": "number", "description": "用户预算上限（元），可选"},
+                "limit": {"type": "integer", "description": "返回数量，默认 5"},
+            },
+            search_product_catalog,
+            required=["query"],
         ),
     }

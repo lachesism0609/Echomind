@@ -36,6 +36,7 @@ from agents.tools import (
     billing_tools,
     escalation_tools,
     general_tools,
+    pre_sale_tools,
     technical_tools,
 )
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
@@ -51,6 +52,7 @@ class AgentType(Enum):
     TECHNICAL = "technical"  # 技术支持
     BILLING   = "billing"    # 账单/退款
     ESCALATION = "escalation" # 人工升级与交接
+    PRE_SALE  = "pre_sale"   # 售前导购
 
 
 @dataclass(frozen=True)
@@ -219,10 +221,10 @@ class BaseAgent:
 
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
-        self.stats.total += 1
         try:
             call_result = await self._call_llm(req)
             ms = (time.monotonic() - t0) * 1000
+            self.stats.total += 1
             self.stats.success += 1
             self.stats.total_ms += ms
             escalate = self._needs_escalation(call_result.content)
@@ -237,6 +239,7 @@ class BaseAgent:
             )
         except Exception as ex:
             ms = (time.monotonic() - t0) * 1000
+            self.stats.total += 1
             self.stats.total_ms += ms
             logger.error(f"{self.agent_type.value} 处理失败: {ex}")
             tools_used = ex.tools_used if isinstance(ex, AgentCallError) else []
@@ -533,6 +536,44 @@ class BillingAgent(BaseAgent):
         return tools
 
 
+class PreSaleAgent(BaseAgent):
+    """售前导购 Agent：商品对比、规格解释、适用场景推荐、礼物建议与选购引导。"""
+
+    agent_type = AgentType.PRE_SALE
+    profile = AgentProfile(
+        role="售前导购与商品顾问",
+        mission="澄清使用场景和预算，检索商品目录与知识库，给出对比、推荐和选购建议；不编造库存与配送时效。",
+        workflow=("澄清场景与预算", "检索商品目录/知识库", "对比或推荐并说明理由", "给出来源与需确认项", "复杂对比时引导比价或人工"),
+        input_contract=("使用场景", "预算范围", "对比对象", "用户画像与历史偏好", "知识库上下文"),
+        output_contract=("推荐或对比结论", "关键差异或规格说明", "适用场景理由", "需在商品页确认的信息"),
+        handoff_conditions=("超过 3 个商品的复杂对比", "需要实时库存、价格或促销确认", "涉及支付、售后或订单操作"),
+        tool_scope=("search_knowledge_base", "search_product_catalog"),
+        temperature=0.6,
+        max_tokens=1000,
+    )
+    system_prompt = (
+        "你是售前导购顾问。负责商品对比、规格解释、适用场景推荐和礼物建议。"
+        "回答要有依据、给理由，避免笼统话术；不伪造库存、价格和配送时效。"
+    )
+
+    def _build_role_packet(self, req: Request) -> str:
+        packet = json.loads(super()._build_role_packet(req))
+        packet["scenario_focus"] = [
+            "product_compare", "product_recommend", "spec_inquiry", "availability"
+        ]
+        packet["guardrails"] = {
+            "stock": "不承诺有货/最后一件，引导到商品页确认",
+            "delivery": "不承诺配送时效，转引物流政策",
+            "complex_compare": "超过 3 个商品的复杂对比引导到比价页面或人工",
+        }
+        return json.dumps(packet, ensure_ascii=False)
+
+    def get_tools(self) -> Dict[str, AgentToolSpec]:
+        tools = super().get_tools()
+        tools.update(pre_sale_tools())
+        return tools
+
+
 class EscalationAgent(BaseAgent):
     """人工升级节点。
 
@@ -661,6 +702,10 @@ class AgentOrchestrator:
         IntentCategory.ACCOUNT_SECURITY: AgentType.BILLING,
         IntentCategory.ESCALATION: AgentType.ESCALATION,
         IntentCategory.HUMAN_HANDOFF: AgentType.ESCALATION,
+        IntentCategory.PRODUCT_COMPARE:   AgentType.PRE_SALE,
+        IntentCategory.PRODUCT_RECOMMEND: AgentType.PRE_SALE,
+        IntentCategory.SPEC_INQUIRY:      AgentType.PRE_SALE,
+        IntentCategory.AVAILABILITY:      AgentType.PRE_SALE,
         # 其余意图 → GENERAL（默认）
     }
 
@@ -693,6 +738,7 @@ class AgentOrchestrator:
             AgentType.TECHNICAL: [self._make_agent(TechnicalAgent, client, model, skill_manager)],
             AgentType.BILLING: [self._make_agent(BillingAgent, client, model, skill_manager)],
             AgentType.ESCALATION: [self._make_agent(EscalationAgent, client, model, skill_manager)],
+            AgentType.PRE_SALE: [self._make_agent(PreSaleAgent, client, model, skill_manager)],
         }
         self.set_shared_tools(build_shared_rag_tools(rag_tool_manager))
 
@@ -919,7 +965,7 @@ class AgentOrchestrator:
         scores = self._domain_scores(req)
         degraded_agents = {
             agent_type
-            for agent_type in (AgentType.TECHNICAL, AgentType.BILLING)
+            for agent_type in (AgentType.TECHNICAL, AgentType.BILLING, AgentType.PRE_SALE)
             if scores.get(agent_type, 0.0) > 0 and self._monitor_degraded(agent_type)
         }
         available_scores = {
@@ -972,6 +1018,7 @@ class AgentOrchestrator:
             AgentType.GENERAL: 0.1,
             AgentType.TECHNICAL: 0.0,
             AgentType.BILLING: 0.0,
+            AgentType.PRE_SALE: 0.0,
         }
 
         if req.intent in (
@@ -1003,17 +1050,28 @@ class AgentOrchestrator:
         ):
             scores[AgentType.BILLING] += 0.75
 
+        if req.intent in (
+            IntentCategory.PRODUCT_COMPARE,
+            IntentCategory.PRODUCT_RECOMMEND,
+            IntentCategory.SPEC_INQUIRY,
+            IntentCategory.AVAILABILITY,
+        ):
+            scores[AgentType.PRE_SALE] += 0.75
+
         technical_kws = ["崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500", "401", "验证码"]
         billing_kws = ["退款", "退货", "扣款", "发票", "账单", "支付", "订阅", "refund", "invoice", "多扣"]
         general_kws = ["订单", "物流", "快递", "配送", "会员", "积分", "咨询", "帮助"]
+        pre_sale_kws = ["对比", "哪个好", "推荐", "适合", "送什么", "礼物", "参数", "规格", "配置", "现货", "库存", "选购", "预算", "功能"]
 
         technical_hits = sum(1 for kw in technical_kws if kw in msg)
         billing_hits = sum(1 for kw in billing_kws if kw in msg)
         general_hits = sum(1 for kw in general_kws if kw in msg)
+        pre_sale_hits = sum(1 for kw in pre_sale_kws if kw in msg)
 
         scores[AgentType.TECHNICAL] += min(0.45, technical_hits * 0.18)
         scores[AgentType.BILLING] += min(0.45, billing_hits * 0.18)
         scores[AgentType.GENERAL] += min(0.35, general_hits * 0.12)
+        scores[AgentType.PRE_SALE] += min(0.45, pre_sale_hits * 0.12)
 
         entities = req.entities or {}
         if entities.get("error_code"):
