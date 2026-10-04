@@ -49,6 +49,10 @@ class IntentCategory(Enum):
     PRODUCT_RECOMMEND = "product_recommend"  # 导购推荐（送什么礼物？）
     SPEC_INQUIRY      = "spec_inquiry"       # 规格参数（支持XX功能吗？）
     AVAILABILITY      = "availability"       # 库存/发货时效（现货吗？几天能到？）
+    PRODUCT_SEARCH    = "product_search"     # 商品搜索（有没有某类商品？）
+    PRODUCT_AVAILABILITY = "product_availability"  # 具体款式/尺码/颜色是否有货
+    PROMOTION         = "promotion"          # 折扣/优惠活动
+    RETURN_POLICY     = "return_policy"      # 退换货政策
     OTHER      = "other"
 
 
@@ -84,7 +88,7 @@ _TEMPLATES: Dict[IntentCategory, List[str]] = {
     IntentCategory.FEEDBACK:   ["服务很棒！", "非常满意", "给个好评"],
     IntentCategory.ORDER_STATUS: ["我的订单现在是什么状态？", "订单有没有发货？", "订单处理到哪一步了？"],
     IntentCategory.LOGISTICS: ["快递什么时候到？", "物流一直不更新", "配送要多久？"],
-    IntentCategory.REFUND: ["我要申请退款", "退货退款怎么处理？", "退款多久到账？"],
+    IntentCategory.REFUND: ["我要申请退款", "退货退款怎么处理？", "退款多久到账？", "七天无理由退换货吗？", "退换货政策是什么？", "换货怎么办？", "退货流程怎么走？"],
     IntentCategory.INVOICE: ["帮我开发票", "发票抬头怎么改？", "电子发票在哪里？"],
     IntentCategory.PAYMENT_ISSUE: ["为什么重复扣款？", "支付失败怎么办？", "这个月多扣了钱"],
     IntentCategory.ACCOUNT_SECURITY: ["账户被盗了", "发现异常登录", "我要重置密码"],
@@ -95,6 +99,10 @@ _TEMPLATES: Dict[IntentCategory, List[str]] = {
     IntentCategory.PRODUCT_RECOMMEND: ["给女朋友送什么礼物？", "帮我推荐一款适合的产品", "预算 3000 买什么好？"],
     IntentCategory.SPEC_INQUIRY: ["这款支持 NFC 功能吗？", "这个产品参数是什么？", "尺寸和重量是多少？"],
     IntentCategory.AVAILABILITY: ["这款有现货吗？", "下单后几天能到？", "现在能发货吗？"],
+    IntentCategory.PRODUCT_SEARCH: ["有没有黑色连衣裙？", "想找一款西装外套", "你们有运动鞋吗？", "帮我找一下牛仔裤"],
+    IntentCategory.PRODUCT_AVAILABILITY: ["这件西装有 M 码吗？", "这个颜色还有货吗？", "这款有 L 码吗？"],
+    IntentCategory.PROMOTION: ["最近有什么折扣？", "现在有优惠活动吗？", "有什么促销？", "有优惠券吗？"],
+    IntentCategory.RETURN_POLICY: ["七天无理由退换货吗？", "退换货政策有哪些要求？", "无理由退货有什么条件？"],
 }
 
 _SPECIFIC_INTENTS = {
@@ -111,6 +119,10 @@ _SPECIFIC_INTENTS = {
     IntentCategory.PRODUCT_RECOMMEND,
     IntentCategory.SPEC_INQUIRY,
     IntentCategory.AVAILABILITY,
+    IntentCategory.PRODUCT_SEARCH,
+    IntentCategory.PRODUCT_AVAILABILITY,
+    IntentCategory.PROMOTION,
+    IntentCategory.RETURN_POLICY,
 }
 
 _GENERIC_INTENTS = {
@@ -131,6 +143,7 @@ _INTENT_GROUPS: Dict[IntentCategory, IntentCategory] = {
     IntentCategory.TECHNICAL_LOGIN: IntentCategory.TECHNICAL,
     IntentCategory.TECHNICAL_CRASH: IntentCategory.TECHNICAL,
     IntentCategory.HUMAN_HANDOFF: IntentCategory.ESCALATION,
+    IntentCategory.RETURN_POLICY: IntentCategory.BILLING,
 }
 
 # 紧急关键词
@@ -266,7 +279,9 @@ class IntentRecognizer:
 
         prompt = f"""你是客服意图分析专家。根据示例判断用户意图，返回 JSON。
 如果用户问题能匹配细粒度业务意图，请优先返回细粒度意图，而不是宽泛大类。
-例如退款优先返回 refund，发票优先返回 invoice，登录故障优先返回 technical_login。
+例如：退款优先返回 refund，发票优先返回 invoice，退换货政策优先返回 return_policy 或 refund，
+搜索某类商品优先返回 product_search，询问某款式/尺码/颜色是否有货优先返回 product_availability，
+折扣与优惠活动优先返回 promotion，登录故障优先返回 technical_login。
 
         {ctx}
         用户消息: "{message}"
@@ -320,7 +335,7 @@ class IntentRecognizer:
             IntentCategory.HUMAN_HANDOFF: ["转人工", "人工客服", "找人工"],
             IntentCategory.ORDER_STATUS: ["订单状态", "发货了吗", "处理到哪", "order status"],
             IntentCategory.LOGISTICS: ["物流", "快递", "配送", "运单", "delivery", "shipping"],
-            IntentCategory.REFUND: ["退款", "退货", "refund", "return"],
+            IntentCategory.REFUND: ["退款", "退货", "退换", "换货", "无理由", "refund", "return"],
             IntentCategory.INVOICE: ["发票", "抬头", "税号", "invoice"],
             IntentCategory.PAYMENT_ISSUE: ["重复扣款", "多扣", "支付失败", "扣费", "payment failed"],
             IntentCategory.ACCOUNT_SECURITY: ["被盗", "异常登录", "重置密码", "两步验证", "安全"],
@@ -330,6 +345,10 @@ class IntentRecognizer:
             IntentCategory.PRODUCT_RECOMMEND: ["推荐", "适合", "送什么", "礼物", "选购", "买什么", "预算"],
             IntentCategory.SPEC_INQUIRY: ["参数", "规格", "配置", "尺寸", "重量", "续航", "像素", "内存", "支持什么功能", "有哪些功能"],
             IntentCategory.AVAILABILITY: ["现货", "库存", "有货", "发货时间", "几天到", "多久到", "什么时候发货", "什么时候到货"],
+            IntentCategory.PRODUCT_SEARCH: ["有没有", "有卖", "找一下", "找一款", "找一件", "想买"],
+            IntentCategory.PRODUCT_AVAILABILITY: ["码吗", "尺码", "码数", "颜色", "还有货", "有货吗", "有没有货"],
+            IntentCategory.PROMOTION: ["折扣", "优惠", "促销", "满减", "优惠券", "活动"],
+            IntentCategory.RETURN_POLICY: ["退换货政策", "退货政策", "换货政策", "七天无理由", "无理由退换", "无理由退货", "退换货"],
         }
         generic_patterns = {
             IntentCategory.ESCALATION: ["投诉", "经理", "supervisor"],

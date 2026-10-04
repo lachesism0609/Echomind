@@ -74,21 +74,48 @@ class KnowledgeBase:
         """
         批量导入文档到知识库。
 
-        documents 格式: [{"title": "...", "content": "..."}, ...]
+        documents 格式: [{"title": "...", "content": "...", "source": "...", "tenant": "...", "document_id": "..."}, ...]
         长文档会自动切片（每片 500 字）。
+        提供 source 或 tenant 时，会先清除同来源/租户的旧片段，实现幂等替换。
         """
         ids, docs, metas = [], [], []
+
+        # 来源/租户替换：同一来源或租户重新同步时，先清除旧 chunk，避免残留。
+        replace_scopes = set()
+        for doc in documents:
+            source = doc.get("source")
+            tenant = doc.get("tenant")
+            if source or tenant:
+                replace_scopes.add((source or None, tenant or None))
+
+        for source, tenant in replace_scopes:
+            deleted = self.delete_by_metadata(source=source, tenant=tenant)
+            if deleted:
+                logger.info(f"按 source={source!r} tenant={tenant!r} 清理 {deleted} 个旧片段")
 
         for doc in documents:
             title   = doc.get("title", "")
             content = doc.get("content", "")
+            source  = doc.get("source")
+            tenant  = doc.get("tenant")
+            document_id = doc.get("document_id")
             chunks  = self._chunk_text(content, chunk_size=500)
 
             for i, chunk in enumerate(chunks):
-                doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
+                if document_id:
+                    doc_id = hashlib.md5(f"{document_id}::{i}".encode()).hexdigest()
+                else:
+                    doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
                 ids.append(doc_id)
                 docs.append(chunk)
-                metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
+                meta = {"title": title, "chunk_index": i, "total_chunks": len(chunks)}
+                if source is not None:
+                    meta["source"] = source
+                if tenant is not None:
+                    meta["tenant"] = tenant
+                if document_id is not None:
+                    meta["document_id"] = str(document_id)
+                metas.append(meta)
 
         if ids:
             # ID 由文档内容稳定生成；upsert 使重复导入幂等，同时允许同 ID 内容更新。
@@ -98,20 +125,51 @@ class KnowledgeBase:
 
         return len(ids)
 
+    def delete_by_metadata(
+        self,
+        source: Optional[str] = None,
+        tenant: Optional[str] = None,
+    ) -> int:
+        """按 source / tenant 删除文档片段，用于重新同步前的清理。"""
+        where: Dict[str, str] = {}
+        if source is not None:
+            where["source"] = source
+        if tenant is not None:
+            where["tenant"] = tenant
+        if not where:
+            return 0
+        existing = self._collection.get(where=where)
+        ids = existing.get("ids", [])
+        if ids:
+            self._collection.delete(ids=ids)
+        return len(ids)
+
     async def add_documents_async(self, documents: List[Dict[str, str]]) -> int:
         """异步导入文档；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
         return await asyncio.to_thread(self.add_documents, documents)
 
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        source: Optional[str] = None,
+        tenant: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
         语义检索：根据 query 返回最相关的文档片段。
 
         ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
+        可选的 source / tenant 用于按业务来源或租户隔离检索结果。
         """
-        results = self._collection.query(
-            query_texts=[query],
-            n_results=top_k,
-        )
+        query_kwargs: Dict[str, Any] = {"query_texts": [query], "n_results": top_k}
+        where: Dict[str, str] = {}
+        if source:
+            where["source"] = source
+        if tenant:
+            where["tenant"] = tenant
+        if where:
+            query_kwargs["where"] = where
+        results = self._collection.query(**query_kwargs)
 
         items = []
         if results["documents"] and results["documents"][0]:
@@ -129,9 +187,15 @@ class KnowledgeBase:
 
         return items
 
-    async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    async def search_async(
+        self,
+        query: str,
+        top_k: int = 5,
+        source: Optional[str] = None,
+        tenant: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """异步检索；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
-        return await asyncio.to_thread(self.search, query, top_k)
+        return await asyncio.to_thread(self.search, query, top_k, source, tenant)
 
     @property
     def doc_count(self) -> int:
@@ -155,7 +219,10 @@ class KnowledgeBase:
         """
         query = params.get("query", "")
         top_k = params.get("top_k", 5)
-        return await self.search_async(query, top_k=top_k)
+        ctx = context or {}
+        source = ctx.get("source") or params.get("source")
+        tenant = ctx.get("tenant") or params.get("tenant")
+        return await self.search_async(query, top_k=top_k, source=source, tenant=tenant)
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 

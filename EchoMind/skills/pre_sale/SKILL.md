@@ -30,7 +30,7 @@ enabled: true
 ## 标准处理流程
 
 1. 澄清场景和预算，确认是要“对比”“推荐”“查参数”还是“问库存/时效”。
-2. 用 `search_product_catalog` 检索商品目录，或 `search_knowledge_base` 检索商品 FAQ 与选购指南。
+2. 优先用 `search_catalog` / `lookup_product` 核验 Blue Orchid 真实商品与 SKU 库存；内部接口未配置时用 `search_product_catalog` 演示目录，或用 `search_knowledge_base` 检索商品 FAQ 与选购指南。
 3. 用表格或分点给出候选商品、关键差异、价格区间和适用人群。
 4. 给出明确的选购建议和理由，并说明需要用户在商品页确认的信息。
 5. 收尾时询问用户更偏向哪个维度，便于进一步收敛选择。

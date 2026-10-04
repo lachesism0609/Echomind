@@ -519,6 +519,12 @@ DEFAULT_INTENT_CASES: List[IntentTestCase] = [
     IntentTestCase("帮我开发票",                  "invoice"),
     IntentTestCase("退款多久到账？",              "refund"),
     IntentTestCase("登录一直报401",               "technical_login"),
+    # Blue Orchid 电商场景
+    IntentTestCase("七天无理由退换货吗",           "return_policy"),
+    IntentTestCase("我的订单发货了吗",             "order_status"),
+    IntentTestCase("这件西装有 M 码吗",            "product_availability"),
+    IntentTestCase("你们最近有什么折扣",           "promotion"),
+    IntentTestCase("有没有黑色连衣裙",             "product_search"),
 ]
 
 DEFAULT_DIALOG_CASES: List[Dict[str, Any]] = [

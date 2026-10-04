@@ -104,6 +104,24 @@ docker compose logs -f echomind
 - `GET /monitor`
 - `POST /eval/run`
 
+## Blue Orchid 电商平台集成
+
+Echomind 通过 Blue Orchid 的同源网关读取真实订单、购物车和商品目录，不直接连接其数据库。相关环境变量：
+
+```env
+BLUE_ORCHID_BASE_URL=http://localhost:3010
+BLUE_ORCHID_INTERNAL_TOKEN=replace-with-echomind-service-token
+BLUE_ORCHID_TIMEOUT_MS=10000
+ECHOMIND_API_TOKEN=replace-with-echomind-client-token
+```
+
+其中 `BLUE_ORCHID_INTERNAL_TOKEN` 必须与 Blue Orchid 的 `ECHOMIND_INTERNAL_TOKEN` 完全一致。接入后：
+
+- `ChatRequest.metadata` 透传 `userId`、`role`、`lang`、`currency` 等上下文。
+- `GeneralAgent` 可调用 `lookup_order`、`lookup_cart`、`search_catalog`、`lookup_product` 四个只读工具。
+- 知识库支持按 `source` / `tenant` 隔离与替换，Blue Orchid 商品目录建议使用 `source=blue-orchid-catalogue`、`tenant=blue-orchid`。
+- `/chat`、`/knowledge/*`、`/eval/run`、`/skills/reload` 在配置 `ECHOMIND_API_TOKEN` 后要求 `X-Internal-Token`。
+
 ## 项目结构
 
 ```text

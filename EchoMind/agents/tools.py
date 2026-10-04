@@ -25,6 +25,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from agents.agent_orchestrator import Request
 
+from integrations.blue_orchid import get_blue_orchid_client
+
 
 AgentToolHandler = Callable[["Request", Dict[str, Any]], Union[Any, Awaitable[Any]]]
 
@@ -186,10 +188,14 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
         if tool_manager is None:
             return {"success": False, "error": "RAG 工具未初始化", "results": []}
 
+        # 租户隔离：Blue Orchid 等租户只检索本租户文档，避免把 EchoMind 默认文档混入回答。
+        tenant = str((req.metadata or {}).get("tenant") or "").strip()
+        context = {"tenant": tenant} if tenant else None
         result = await tool_manager.search_with_rewrite(
             "knowledge_search",
             query,
             top_k=top_k,
+            context=context,
         )
         if not getattr(result, "success", False):
             return {
@@ -289,6 +295,150 @@ def escalation_tools() -> Dict[str, AgentToolSpec]:
             "生成交给人工客服的结构化交接摘要，不会创建真实工单。",
             {"reason": {"type": "string", "description": "需要升级的原因"}},
             create_handoff_summary,
+        ),
+    }
+
+
+# ── Blue Orchid 电商业务工具 ─────────────────────────────────────────────────
+
+def _blue_orchid_user_id(req: Request) -> str:
+    """从 Blue Orchid 写入的 metadata 中读取用户 id。"""
+    return str((req.metadata or {}).get("userId") or "").strip()
+
+
+async def lookup_order(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+    """查询 Blue Orchid 真实订单与订单明细（只读）。"""
+    user_id = _blue_orchid_user_id(req)
+    if not user_id:
+        return {"success": False, "error": "用户未登录，无法查询订单，请先登录。", "orders": []}
+
+    try:
+        order_id = str(args.get("order_id") or "").strip()
+        limit = max(1, min(int(args.get("limit", 5) or 5), 50))
+        data = await get_blue_orchid_client().orders(user_id, limit=limit)
+    except Exception as ex:
+        return {"success": False, "error": f"查询订单失败: {ex}", "orders": []}
+
+    orders = data.get("orders", [])
+    if order_id:
+        orders = [order for order in orders if str(order.get("id") or "") == order_id]
+    return {
+        "success": True,
+        "user_id": user_id,
+        "orders": orders,
+        "found": bool(orders),
+    }
+
+
+async def lookup_cart(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+    """查询 Blue Orchid 当前用户的收藏与购物车（只读）。"""
+    user_id = _blue_orchid_user_id(req)
+    if not user_id:
+        return {"success": False, "error": "用户未登录，无法查询购物车或收藏，请先登录。"}
+
+    try:
+        data = await get_blue_orchid_client().store_state(user_id)
+    except Exception as ex:
+        return {"success": False, "error": f"查询购物车失败: {ex}"}
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "favourites": data.get("favourites", []),
+        "cart": data.get("cart", []),
+    }
+
+
+async def search_catalog(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+    """按关键词、分类、库存检索 Blue Orchid 商品目录（只读）。"""
+    query = str(args.get("query") or req.message or "").strip()
+    if not query:
+        return {"success": False, "error": "query 不能为空", "items": []}
+
+    category = str(args.get("category") or "").strip()
+    in_stock_only = bool(args.get("in_stock_only", False))
+    limit = max(1, min(int(args.get("limit", 10) or 10), 50))
+    try:
+        data = await get_blue_orchid_client().search_products(
+            query,
+            limit=limit,
+            category=category,
+            in_stock=in_stock_only,
+        )
+    except Exception as ex:
+        return {"success": False, "error": f"商品检索失败: {ex}", "items": []}
+
+    items = data.get("items", [])
+    return {
+        "success": True,
+        "query": query,
+        "category": category or None,
+        "in_stock_only": in_stock_only,
+        "items": items,
+        "total": data.get("total", len(items)),
+        "matched": len(items),
+    }
+
+
+async def lookup_product(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+    """查询 Blue Orchid 单品的款式、尺码与 SKU 库存（只读）。"""
+    raw_id = args.get("product_id")
+    if raw_id is None:
+        return {"success": False, "error": "缺少 product_id"}
+    try:
+        product_id = int(raw_id)
+    except (TypeError, ValueError):
+        return {"success": False, "error": "product_id 必须是整数"}
+
+    try:
+        data = await get_blue_orchid_client().product(product_id)
+    except Exception as ex:
+        return {"success": False, "error": f"查询商品失败: {ex}"}
+
+    product = data.get("product")
+    if not product:
+        return {"success": False, "error": "未找到该商品", "product": None}
+    return {"success": True, "product": product}
+
+
+def blue_orchid_tools() -> Dict[str, AgentToolSpec]:
+    """Blue Orchid 电商只读工具，供 General / Billing / Technical / PreSale Agent 按需挂载。"""
+    return {
+        "lookup_order": make_tool(
+            "lookup_order",
+            "查询 Blue Orchid 用户的真实订单状态、商品明细和收货信息。仅返回已核验的订单数据。",
+            {
+                "order_id": {"type": "string", "description": "可选，按订单号过滤；为空返回最近订单"},
+                "limit": {"type": "integer", "description": "返回最近订单数量，默认 5，最大 50"},
+            },
+            lookup_order,
+        ),
+        "lookup_cart": make_tool(
+            "lookup_cart",
+            "查询 Blue Orchid 当前用户的收藏与购物车。未登录时不能调用。",
+            {},
+            lookup_cart,
+        ),
+        "search_catalog": make_tool(
+            "search_catalog",
+            "检索 Blue Orchid 商品目录，返回商品、价格、分类和库存概览。回答有没有某商品、什么价格、有没有货时必须优先使用。",
+            {
+                "query": {"type": "string", "description": "商品关键词，例如黑色连衣裙、blazer"},
+                "category": {"type": "string", "description": "可选，商品分类"},
+                "in_stock_only": {"type": "boolean", "description": "只返回有库存的商品"},
+                "limit": {"type": "integer", "description": "返回数量，默认 10，最大 50"},
+            },
+            search_catalog,
+            required=["query"],
+        ),
+        "lookup_product": make_tool(
+            "lookup_product",
+            "查询 Blue Orchid 单品详情，包括款式、颜色、尺码和 SKU 库存。回答某商品有没有某尺码、库存多少时必须优先使用。",
+            {
+                "product_id": {"type": "integer", "description": "商品 ID"},
+            },
+            lookup_product,
+            required=["product_id"],
         ),
     }
 

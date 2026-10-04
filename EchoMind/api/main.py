@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import pathlib
+import secrets
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -20,7 +21,7 @@ if _ROOT not in sys.path:
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Response, UploadFile, File
+from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Request as HttpRequest
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
@@ -196,19 +197,54 @@ app = FastAPI(
     docs_url="/docs",
 )
 
+_cors_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000,http://localhost:3010,http://127.0.0.1:3010",
+    ).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+def _require_internal_token(request: HttpRequest) -> None:
+    """校验内部接口的 ``X-Internal-Token``。
+
+    未配置 ``ECHOMIND_API_TOKEN`` 时保持向后兼容（本地开发模式）；
+    配置后，/chat、/knowledge/*、/eval/run、/skills/reload 都要求携带该令牌。
+    """
+    expected = os.getenv("ECHOMIND_API_TOKEN", "").strip()
+    if not expected:
+        return
+    provided = request.headers.get("X-Internal-Token", "")
+    if not secrets.compare_digest(provided, expected):
+        raise HTTPException(401, "缺少或无效的内部令牌")
+
+
 # ── 请求/响应模型 ─────────────────────────────────────────────────────────────
+class ChatMetadata(BaseModel):
+    """Blue Orchid 同源网关透传的租户与用户上下文。"""
+    tenant:      str = "blue-orchid"
+    userId:      Optional[str] = None
+    userName:    Optional[str] = None
+    role:        str = "anonymous"
+    lang:        Optional[str] = None
+    currency:    Optional[str] = None
+    page:        Optional[Dict[str, Any]] = None
+
+
 class ChatRequest(BaseModel):
     message:     str
     user_id:     str = "anonymous"
     conv_id:     Optional[str] = None
+    metadata:    Optional[ChatMetadata] = None
 
 
 class ChatResponse(BaseModel):
@@ -259,8 +295,9 @@ async def skills_summary():
 
 
 @app.post("/skills/reload", tags=["Skills"])
-async def reload_skills():
+async def reload_skills(request: HttpRequest):
     """运行时重新扫描 Skill 目录，不需要重启服务。"""
+    _require_internal_token(request)
     if _skill_manager is None:
         raise HTTPException(503, "Skills 未初始化")
     _skill_manager.reload()
@@ -270,11 +307,12 @@ async def reload_skills():
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: HttpRequest):
     """
     主对话接口。完整流程：
       记忆读取 → 意图识别 → Agent 路由 → 执行 → 记忆写入
     """
+    _require_internal_token(request)
     if _orchestrator is None or _memory is None:
         raise HTTPException(503, "服务未就绪")
 
@@ -306,6 +344,7 @@ async def chat(req: ChatRequest):
         intent_group=intent_result.intent_group,
         urgency=intent_result.urgency,
         intent_confidence=intent_result.confidence,
+        metadata=req.metadata.model_dump() if req.metadata else {},
     )
 
     # 3. 执行
@@ -391,6 +430,9 @@ class DocInput(BaseModel):
     """单篇文档输入。"""
     title:   str
     content: str
+    source:  Optional[str] = None
+    tenant:  Optional[str] = None
+    document_id: Optional[str] = None
 
 
 class BatchDocInput(BaseModel):
@@ -420,33 +462,45 @@ class EvalRunInput(BaseModel):
 
 
 @app.post("/knowledge/add", tags=["知识库"])
-async def add_knowledge(body: BatchDocInput):
+async def add_knowledge(body: BatchDocInput, request: HttpRequest):
     """
     批量导入文档到知识库。
 
     文档会自动切片（每片 500 字）并存入 ChromaDB，ChromaDB 内置 Embedding 模型自动向量化。
+    可选的 source / tenant 用于按业务来源或租户隔离，并在重新同步时替换旧片段。
 
     示例请求体：
     ```json
     {
       "documents": [
-        {"title": "退款政策", "content": "用户在购买后 7 天内可以申请无理由退款..."},
+        {"title": "退款政策", "content": "用户在购买后 7 天内可以申请无理由退款...", "source": "blue-orchid-catalogue", "tenant": "blue-orchid"},
         {"title": "配送说明", "content": "标准配送 3-5 个工作日..."}
       ]
     }
     ```
     """
+    _require_internal_token(request)
     tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    count = await kb.add_documents_async([{"title": d.title, "content": d.content} for d in body.documents])
+    docs = []
+    for d in body.documents:
+        item = {"title": d.title, "content": d.content}
+        if d.source is not None:
+            item["source"] = d.source
+        if d.tenant is not None:
+            item["tenant"] = d.tenant
+        if d.document_id is not None:
+            item["document_id"] = d.document_id
+        docs.append(item)
+    count = await kb.add_documents_async(docs)
     total = await kb.doc_count_async()
     return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": total}
 
 
 @app.post("/knowledge/upload", tags=["知识库"])
-async def upload_knowledge(file: UploadFile = File(...)):
+async def upload_knowledge(request: HttpRequest, file: UploadFile = File(...)):
     """
     上传文件导入知识库。
 
@@ -456,6 +510,7 @@ async def upload_knowledge(file: UploadFile = File(...)):
 
     文件大小限制：10MB
     """
+    _require_internal_token(request)
     tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
@@ -501,8 +556,9 @@ async def knowledge_stats():
 
 
 @app.post("/eval/run")
-async def run_eval(body: Optional[EvalRunInput] = None):
+async def run_eval(request: HttpRequest, body: Optional[EvalRunInput] = None):
     """运行内置评测用例，返回评测报告。"""
+    _require_internal_token(request)
     if _evaluator is None:
         raise HTTPException(503, "服务未就绪")
     from evaluation.evaluator import DEFAULT_DIALOG_CASES, DEFAULT_INTENT_CASES, IntentTestCase

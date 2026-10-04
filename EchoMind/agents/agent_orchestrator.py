@@ -32,6 +32,7 @@ from anthropic import AsyncAnthropic
 
 from agents.tools import (
     AgentToolSpec,
+    blue_orchid_tools,
     build_shared_rag_tools,
     billing_tools,
     escalation_tools,
@@ -147,6 +148,7 @@ class Request:
     conv_id:     str
     context:     str = ""        # 来自 MemoryManager 的格式化上下文
     history:     Optional[List[Dict[str, str]]] = None  # 对话历史，传给意图识别
+    metadata:    Dict[str, Any] = field(default_factory=dict)  # 网关透传的租户/用户信息
     entities:    Dict[str, List[str]] = field(default_factory=dict)
     intent:      Optional[IntentCategory] = None
     intent_group: Optional[str] = None
@@ -442,12 +444,24 @@ class GeneralAgent(BaseAgent):
         input_contract=("对话历史", "用户画像", "意图与紧急度", "知识库上下文"),
         output_contract=("先回应核心问题", "信息不足时只询问必要字段", "明确下一步和边界"),
         handoff_conditions=("涉及权限、资金、隐私或复杂投诉", "用户明确要求人工"),
-        tool_scope=("search_knowledge_base", "inspect_request_context", "suggest_required_fields"),
+        tool_scope=(
+            "search_knowledge_base",
+            "lookup_order",
+            "lookup_cart",
+            "search_catalog",
+            "lookup_product",
+            "inspect_request_context",
+            "suggest_required_fields",
+        ),
         temperature=0.3,
         max_tokens=900,
     )
     system_prompt = (
         "你是 EchoMind 智能客服。友好、简洁地回答用户问题。"
+        "订单状态、物流进度、价格和库存必须通过工具核验后才能回答。"
+        "没有用户登录信息（userId）时不能调用订单或购物车工具，应提示用户先登录。"
+        "不能声称已经执行退款、取消订单、修改地址或补发等写操作。"
+        "缺少订单号时最多询问一次，不能反复索要隐私信息。"
         "如果问题超出你的能力范围，明确说明并建议转接专业客服。"
     )
 
@@ -460,6 +474,7 @@ class GeneralAgent(BaseAgent):
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         tools = super().get_tools()
         tools.update(general_tools())
+        tools.update(blue_orchid_tools())
         return tools
 
 
@@ -472,7 +487,7 @@ class TechnicalAgent(BaseAgent):
         input_contract=("错误码", "问题发生时间", "运行环境", "影响范围", "最近变更", "知识库上下文"),
         output_contract=("现象复述", "可能原因", "编号排查步骤", "验证结果", "需要补充的信息"),
         handoff_conditions=("生产大面积不可用", "数据丢失或权限异常", "需要后台日志、数据库或人工操作"),
-        tool_scope=("search_knowledge_base", "lookup_error_code", "build_diagnostic_plan"),
+        tool_scope=("search_knowledge_base", "lookup_error_code", "build_diagnostic_plan", "lookup_order"),
         temperature=0.1,
         max_tokens=1200,
     )
@@ -493,6 +508,7 @@ class TechnicalAgent(BaseAgent):
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         tools = super().get_tools()
         tools.update(technical_tools())
+        tools.update({"lookup_order": blue_orchid_tools()["lookup_order"]})
         return tools
 
 
@@ -505,13 +521,15 @@ class BillingAgent(BaseAgent):
         input_contract=("订单号", "金额与币种", "支付时间", "支付渠道", "用户期望", "知识库上下文"),
         output_contract=("需要核验的信息", "当前可判断内容", "下一步处理路径", "时效边界"),
         handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单"),
-        tool_scope=("search_knowledge_base", "check_billing_fields", "compare_amounts"),
+        tool_scope=("search_knowledge_base", "lookup_order", "check_billing_fields", "compare_amounts"),
         temperature=0.0,
         max_tokens=1100,
     )
     system_prompt = (
         "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
         "对财务问题保持准确和专业。涉及实际退款操作时，说明需要人工审核。"
+        "订单状态、退款进度和金额必须通过工具核验后才能回答。"
+        "不能声称已经执行退款、取消订单或修改账单；缺少订单号时最多询问一次。"
     )
 
     def _build_role_packet(self, req: Request) -> str:
@@ -533,6 +551,7 @@ class BillingAgent(BaseAgent):
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         tools = super().get_tools()
         tools.update(billing_tools())
+        tools.update({"lookup_order": blue_orchid_tools()["lookup_order"]})
         return tools
 
 
@@ -547,13 +566,15 @@ class PreSaleAgent(BaseAgent):
         input_contract=("使用场景", "预算范围", "对比对象", "用户画像与历史偏好", "知识库上下文"),
         output_contract=("推荐或对比结论", "关键差异或规格说明", "适用场景理由", "需在商品页确认的信息"),
         handoff_conditions=("超过 3 个商品的复杂对比", "需要实时库存、价格或促销确认", "涉及支付、售后或订单操作"),
-        tool_scope=("search_knowledge_base", "search_product_catalog"),
+        tool_scope=("search_knowledge_base", "search_product_catalog", "search_catalog", "lookup_product"),
         temperature=0.6,
         max_tokens=1000,
     )
     system_prompt = (
         "你是售前导购顾问。负责商品对比、规格解释、适用场景推荐和礼物建议。"
         "回答要有依据、给理由，避免笼统话术；不伪造库存、价格和配送时效。"
+        "商品是否存在、价格、尺码和库存必须通过 search_catalog 或 lookup_product 核验后才能回答。"
+        "库存与价格实时变化，请以工具返回结果和商品页为准，不要承诺有货或最后一件。"
     )
 
     def _build_role_packet(self, req: Request) -> str:
@@ -571,6 +592,8 @@ class PreSaleAgent(BaseAgent):
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         tools = super().get_tools()
         tools.update(pre_sale_tools())
+        blue_orchid = blue_orchid_tools()
+        tools.update({"search_catalog": blue_orchid["search_catalog"], "lookup_product": blue_orchid["lookup_product"]})
         return tools
 
 
@@ -706,6 +729,10 @@ class AgentOrchestrator:
         IntentCategory.PRODUCT_RECOMMEND: AgentType.PRE_SALE,
         IntentCategory.SPEC_INQUIRY:      AgentType.PRE_SALE,
         IntentCategory.AVAILABILITY:      AgentType.PRE_SALE,
+        IntentCategory.PRODUCT_SEARCH:       AgentType.PRE_SALE,
+        IntentCategory.PRODUCT_AVAILABILITY: AgentType.PRE_SALE,
+        IntentCategory.PROMOTION:            AgentType.PRE_SALE,
+        IntentCategory.RETURN_POLICY:        AgentType.BILLING,
         # 其余意图 → GENERAL（默认）
     }
 
@@ -1047,6 +1074,7 @@ class AgentOrchestrator:
             IntentCategory.REFUND,
             IntentCategory.INVOICE,
             IntentCategory.PAYMENT_ISSUE,
+            IntentCategory.RETURN_POLICY,
         ):
             scores[AgentType.BILLING] += 0.75
 
@@ -1055,13 +1083,16 @@ class AgentOrchestrator:
             IntentCategory.PRODUCT_RECOMMEND,
             IntentCategory.SPEC_INQUIRY,
             IntentCategory.AVAILABILITY,
+            IntentCategory.PRODUCT_SEARCH,
+            IntentCategory.PRODUCT_AVAILABILITY,
+            IntentCategory.PROMOTION,
         ):
             scores[AgentType.PRE_SALE] += 0.75
 
         technical_kws = ["崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500", "401", "验证码"]
         billing_kws = ["退款", "退货", "扣款", "发票", "账单", "支付", "订阅", "refund", "invoice", "多扣"]
         general_kws = ["订单", "物流", "快递", "配送", "会员", "积分", "咨询", "帮助"]
-        pre_sale_kws = ["对比", "哪个好", "推荐", "适合", "送什么", "礼物", "参数", "规格", "配置", "现货", "库存", "选购", "预算", "功能"]
+        pre_sale_kws = ["对比", "哪个好", "推荐", "适合", "送什么", "礼物", "参数", "规格", "配置", "现货", "库存", "选购", "预算", "功能", "折扣", "优惠", "促销", "活动", "尺码", "码数", "颜色", "有货"]
 
         technical_hits = sum(1 for kw in technical_kws if kw in msg)
         billing_hits = sum(1 for kw in billing_kws if kw in msg)
@@ -1127,6 +1158,7 @@ class AgentOrchestrator:
             IntentCategory.REFUND,
             IntentCategory.INVOICE,
             IntentCategory.PAYMENT_ISSUE,
+            IntentCategory.RETURN_POLICY,
         ) or any(kw in msg for kw in billing_kws):
             targets.append(AgentType.BILLING)
 
