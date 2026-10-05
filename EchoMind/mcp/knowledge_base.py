@@ -131,18 +131,26 @@ class KnowledgeBase:
         tenant: Optional[str] = None,
     ) -> int:
         """按 source / tenant 删除文档片段，用于重新同步前的清理。"""
-        where: Dict[str, str] = {}
-        if source is not None:
-            where["source"] = source
-        if tenant is not None:
-            where["tenant"] = tenant
-        if not where:
+        where = self._build_where(source=source, tenant=tenant)
+        if where is None:
             return 0
         existing = self._collection.get(where=where)
         ids = existing.get("ids", [])
         if ids:
             self._collection.delete(ids=ids)
         return len(ids)
+
+    @staticmethod
+    def _build_where(**conditions: Optional[str]) -> Optional[Dict[str, Any]]:
+        """构造 ChromaDB 的 where 条件。
+
+        ChromaDB 只接受一个顶级操作符，多条件必须用 ``$and`` 组合，
+        否则会抛 ``Expected where to have exactly one operator``。
+        """
+        filters = [{key: value} for key, value in conditions.items() if value is not None]
+        if not filters:
+            return None
+        return filters[0] if len(filters) == 1 else {"$and": filters}
 
     async def add_documents_async(self, documents: List[Dict[str, str]]) -> int:
         """异步导入文档；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
@@ -162,11 +170,7 @@ class KnowledgeBase:
         可选的 source / tenant 用于按业务来源或租户隔离检索结果。
         """
         query_kwargs: Dict[str, Any] = {"query_texts": [query], "n_results": top_k}
-        where: Dict[str, str] = {}
-        if source:
-            where["source"] = source
-        if tenant:
-            where["tenant"] = tenant
+        where = self._build_where(source=source, tenant=tenant)
         if where:
             query_kwargs["where"] = where
         results = self._collection.query(**query_kwargs)

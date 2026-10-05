@@ -295,11 +295,22 @@ class IntentRecognizer:
         try:
             resp = await self.client.messages.create(
                 model=self.model,
-                max_tokens=256,
+                # 推理型模型（如 deepseek-v4-pro）会先输出 thinking 块。
+                # 预算过小会让推理吃满额度、最终没有 text 块，导致 JSON 解析失败。
+                max_tokens=1200,
                 temperature=0.1,
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = extract_text_content(resp.content)
+            if not raw.strip():
+                block_types = [
+                    (block.get("type") if isinstance(block, dict) else getattr(block, "type", None))
+                    for block in (resp.content or [])
+                ]
+                raise ValueError(
+                    f"LLM 未返回文本块（content_types={block_types}, "
+                    f"stop_reason={getattr(resp, 'stop_reason', None)}）"
+                )
             s, e = raw.find("{"), raw.rfind("}") + 1
             data = json.loads(raw[s:e])
             try:
@@ -378,11 +389,19 @@ class IntentRecognizer:
             "pattern": float(pat.get("confidence", 0.0) or 0.0),
         }
         if llm.get("failed"):
-            if emb.get("intent") != IntentCategory.OTHER and emb.get("confidence", 0.0) > 0:
-                return emb["intent"], source_scores["embedding"], source_scores
-            if pat.get("intent") != IntentCategory.OTHER and pat.get("confidence", 0.0) > 0:
-                return pat["intent"], source_scores["pattern"], source_scores
-            return IntentCategory.OTHER, 0.0, source_scores
+            # LLM 失败时，在向量与关键词两路里取置信度更高的一路，
+            # 并同样施加阈值：低置信度的结果宁可返回 OTHER，也不要给出错误意图。
+            candidates = [
+                (emb.get("intent", IntentCategory.OTHER), float(emb.get("confidence", 0.0) or 0.0)),
+                (pat.get("intent", IntentCategory.OTHER), float(pat.get("confidence", 0.0) or 0.0)),
+            ]
+            best_intent, best_conf = IntentCategory.OTHER, 0.0
+            for cat, conf in candidates:
+                if cat != IntentCategory.OTHER and conf > best_conf:
+                    best_intent, best_conf = cat, conf
+            if best_conf < self.threshold:
+                return IntentCategory.OTHER, best_conf, source_scores
+            return best_intent, best_conf, source_scores
 
         if self._embedding_enabled:
             weights = [(llm, 0.7), (emb, 0.2), (pat, 0.1)]

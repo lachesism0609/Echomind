@@ -301,6 +301,9 @@ def escalation_tools() -> Dict[str, AgentToolSpec]:
 
 # ── Blue Orchid 电商业务工具 ─────────────────────────────────────────────────
 
+_TOOL_FAILURE_HINT = "（请勿重复调用同一工具，直接如实告知用户暂时无法查询）"
+
+
 def _blue_orchid_user_id(req: Request) -> str:
     """从 Blue Orchid 写入的 metadata 中读取用户 id。"""
     return str((req.metadata or {}).get("userId") or "").strip()
@@ -317,7 +320,7 @@ async def lookup_order(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
         limit = max(1, min(int(args.get("limit", 5) or 5), 50))
         data = await get_blue_orchid_client().orders(user_id, limit=limit)
     except Exception as ex:
-        return {"success": False, "error": f"查询订单失败: {ex}", "orders": []}
+        return {"success": False, "error": f"查询订单失败: {ex}{_TOOL_FAILURE_HINT}", "orders": []}
 
     orders = data.get("orders", [])
     if order_id:
@@ -339,7 +342,7 @@ async def lookup_cart(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
     try:
         data = await get_blue_orchid_client().store_state(user_id)
     except Exception as ex:
-        return {"success": False, "error": f"查询购物车失败: {ex}"}
+        return {"success": False, "error": f"查询购物车失败: {ex}{_TOOL_FAILURE_HINT}"}
 
     return {
         "success": True,
@@ -366,7 +369,7 @@ async def search_catalog(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
             in_stock=in_stock_only,
         )
     except Exception as ex:
-        return {"success": False, "error": f"商品检索失败: {ex}", "items": []}
+        return {"success": False, "error": f"商品检索失败: {ex}{_TOOL_FAILURE_HINT}", "items": []}
 
     items = data.get("items", [])
     return {
@@ -393,7 +396,7 @@ async def lookup_product(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
     try:
         data = await get_blue_orchid_client().product(product_id)
     except Exception as ex:
-        return {"success": False, "error": f"查询商品失败: {ex}"}
+        return {"success": False, "error": f"查询商品失败: {ex}{_TOOL_FAILURE_HINT}"}
 
     product = data.get("product")
     if not product:

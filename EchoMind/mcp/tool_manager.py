@@ -297,7 +297,8 @@ class MCPToolManager:
         prompt = self._clean_text(prompt)
         try:
             resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.3,
+                # 推理型模型需要额外预算输出 thinking，否则可能没有 text 块。
+                model=self._model, max_tokens=1000, temperature=0.3,
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = extract_text_content(resp.content)
@@ -376,7 +377,7 @@ class MCPToolManager:
 
         try:
             resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.0,
+                model=self._model, max_tokens=1000, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = extract_text_content(resp.content)

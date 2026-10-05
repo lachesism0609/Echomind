@@ -427,7 +427,31 @@ class BaseAgent:
             "intent_confidence": round(req.intent_confidence, 4),
             "available_entities": req.entities or {},
         }
+        request_metadata = self._request_metadata_for_prompt(req)
+        if request_metadata:
+            packet["request_metadata"] = request_metadata
         return json.dumps(packet, ensure_ascii=False)
+
+    @staticmethod
+    def _request_metadata_for_prompt(req: Request) -> Dict[str, Any]:
+        """把注入型 metadata 摘要给 LLM。
+
+        只暴露决策需要的字段，不把 ``userId`` / ``userName`` 等标识符写进 prompt：
+        订单与购物车工具在服务端自行读取 ``userId``，模型只需要知道「是否已登录」。
+        """
+        metadata = req.metadata or {}
+        summary: Dict[str, Any] = {}
+        for key in ("tenant", "role", "lang", "currency"):
+            value = metadata.get(key)
+            if value:
+                summary[key] = value
+        summary["logged_in"] = bool(str(metadata.get("userId") or "").strip())
+        page = metadata.get("page")
+        if isinstance(page, dict):
+            safe_page = {key: page[key] for key in ("productId", "category", "path", "url") if key in page}
+            if safe_page:
+                summary["page"] = safe_page
+        return summary
 
     def _needs_escalation(self, content: str) -> bool:
         """检测 Agent 是否建议升级（简单关键词检测）。"""
@@ -459,7 +483,10 @@ class GeneralAgent(BaseAgent):
     system_prompt = (
         "你是 EchoMind 智能客服。友好、简洁地回答用户问题。"
         "订单状态、物流进度、价格和库存必须通过工具核验后才能回答。"
-        "没有用户登录信息（userId）时不能调用订单或购物车工具，应提示用户先登录。"
+        "request_metadata.logged_in 为 true 说明用户已登录，可直接调用订单或购物车工具核验，不要要求用户再次登录。"
+        "没有用户登录信息时不能调用订单或购物车工具，应提示用户先登录。"
+        "如果 request_metadata.page.productId 存在，用户说“这件商品”时直接用该 productId 调用 lookup_product。"
+        "工具返回失败时不要重复调用同一个工具，最多重试一次，然后如实告知用户暂时无法查询。"
         "不能声称已经执行退款、取消订单、修改地址或补发等写操作。"
         "缺少订单号时最多询问一次，不能反复索要隐私信息。"
         "如果问题超出你的能力范围，明确说明并建议转接专业客服。"
@@ -529,6 +556,8 @@ class BillingAgent(BaseAgent):
         "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
         "对财务问题保持准确和专业。涉及实际退款操作时，说明需要人工审核。"
         "订单状态、退款进度和金额必须通过工具核验后才能回答。"
+        "request_metadata.logged_in 为 true 说明用户已登录，可直接调用 lookup_order 核验，不要要求用户再次登录。"
+        "工具返回失败时不要重复调用同一个工具，最多重试一次，然后如实告知用户暂时无法查询。"
         "不能声称已经执行退款、取消订单或修改账单；缺少订单号时最多询问一次。"
     )
 
@@ -574,6 +603,8 @@ class PreSaleAgent(BaseAgent):
         "你是售前导购顾问。负责商品对比、规格解释、适用场景推荐和礼物建议。"
         "回答要有依据、给理由，避免笼统话术；不伪造库存、价格和配送时效。"
         "商品是否存在、价格、尺码和库存必须通过 search_catalog 或 lookup_product 核验后才能回答。"
+        "如果 request_metadata.page.productId 存在，用户说“这件商品”时直接用该 productId 调用 lookup_product，不要反问商品名称。"
+        "工具返回失败时不要重复调用同一个工具，最多重试一次，然后如实告知用户暂时无法查询。"
         "库存与价格实时变化，请以工具返回结果和商品页为准，不要承诺有货或最后一件。"
     )
 
@@ -737,8 +768,11 @@ class AgentOrchestrator:
     }
 
     # Monitor 的降权达到该值时，专业 Agent 暂停接收新请求并回退到 GeneralAgent。
-    # 使用环境变量可按线上数据调整，默认值与 Monitor 的严重成功率惩罚上限一致。
-    MONITOR_FALLBACK_PENALTY = 0.5
+    # 惩罚值由「成功率不足」和「平均延迟过高」两部分叠加（见 PerformanceMonitor._routing_penalty）：
+    # 慢模型（单次 5-9 秒）本身就会带来约 0.2 的延迟惩罚，若仍用 0.5 阈值，
+    # 健康但偏慢的 Agent 会被反复踢出路由，导致商品/账单问题错误回落到 GeneralAgent。
+    # 因此默认提高到 0.75，只在明显退化时回退；可用 ECHOMIND_MONITOR_FALLBACK_PENALTY 覆盖。
+    MONITOR_FALLBACK_PENALTY = 0.75
 
     def __init__(
         self,
